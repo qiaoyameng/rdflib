@@ -22,14 +22,14 @@ from rdflib.exceptions import Error
 from rdflib.graph import Graph
 from rdflib.namespace import RDF, RDFS
 from rdflib.serializer import Serializer
-from rdflib.term import BNode, Literal, Node, URIRef
+from rdflib.term import BNode, Literal, Node, QuotedTriple, URIRef
 
 _StrT = TypeVar("_StrT", bound=str)
 
 if TYPE_CHECKING:
     from rdflib.graph import _PredicateType, _SubjectType, _TripleType
 
-__all__ = ["RecursiveSerializer", "TurtleSerializer"]
+__all__ = ["RecursiveSerializer", "TurtleSerializer", "TurtleStarSerializer"]
 
 
 class RecursiveSerializer(Serializer):
@@ -403,6 +403,11 @@ class TurtleSerializer(RecursiveSerializer):
         return True
 
     def label(self, node: Node, position: int) -> str:
+        if isinstance(node, QuotedTriple):
+            raise Error(
+                "Cannot serialize quoted triples with the %s serializer, "
+                "use the turtlestar format instead" % self.short_name
+            )
         if node == RDF.nil:
             return "()"
         if position is VERB and node in self.keywords:
@@ -512,3 +517,50 @@ class TurtleSerializer(RecursiveSerializer):
             self.write(",\n" + self.indent(1))
             self.path(obj, OBJECT, newline=True)
         self.depth -= depthmod
+
+
+class TurtleStarSerializer(TurtleSerializer):
+    """Turtle-star RDF graph serializer.
+
+    Serializes graphs that may contain :class:`rdflib.term.QuotedTriple`
+    terms using the RDF-star quoted triple syntax ``<< s p o >>``.
+
+    Note that this first version only supports the quoted triple syntax;
+    it does not claim to cover all RDF 1.2 syntax.
+    """
+
+    short_name = "turtlestar"
+
+    def label(self, node: Node, position: int) -> str:
+        if isinstance(node, QuotedTriple):
+            if position is VERB:
+                raise Error("Cannot serialize a quoted triple as a predicate")
+            return self.quotedTripleLabel(node)
+        return super().label(node, position)
+
+    def quotedTripleLabel(self, quoted: QuotedTriple) -> str:
+        return "<< %s %s %s >>" % (
+            self.label(quoted.subject, SUBJECT),
+            self.label(quoted.predicate, VERB),
+            self.label(quoted.object, OBJECT),
+        )
+
+    def preprocessTriple(self, triple: _TripleType) -> None:
+        super().preprocessTriple(triple)
+        for node in (triple[0], triple[2]):
+            if isinstance(node, QuotedTriple):
+                self.preprocessQuotedTriple(node)
+
+    def preprocessQuotedTriple(self, quoted: QuotedTriple) -> None:
+        for i, node in enumerate(quoted):
+            if isinstance(node, QuotedTriple):
+                self.preprocessQuotedTriple(node)
+                continue
+            self.get_pname(node, gen_prefix=(i == VERB))
+            if isinstance(node, Literal) and node.datatype:
+                self.get_pname(node.datatype, gen_prefix=_GEN_QNAME_FOR_DT)
+            if isinstance(node, BNode):
+                # Make sure blank nodes mentioned inside quoted triples are
+                # never inlined as `[ ... ]` elsewhere, so that their label
+                # (and thus their identity) survives a round-trip.
+                self._references[node] += 1

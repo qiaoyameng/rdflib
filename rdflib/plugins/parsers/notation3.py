@@ -59,6 +59,7 @@ from rdflib.term import (
     Identifier,
     Literal,
     Node,
+    QuotedTriple,
     URIRef,
     Variable,
     _unique_id,
@@ -71,6 +72,7 @@ __all__ = [
     "BadSyntax",
     "N3Parser",
     "TurtleParser",
+    "TurtleStarParser",
     "splitFragP",
     "join",
     "base",
@@ -391,6 +393,10 @@ class sfloat(str):  # noqa: N801
 
 
 class SinkParser:
+    # Maximum nesting depth for Turtle-star quoted triples
+    # (``<< << ... >> ... >>``). Exceeding it is a syntax error.
+    max_quoted_depth: int = 8
+
     def __init__(
         self,
         store: RDFSink,
@@ -400,6 +406,7 @@ class SinkParser:
         genPrefix: str = "",
         why: Optional[Callable[[], None]] = None,
         turtle: bool = False,
+        rdfstar: bool = False,
     ):
         """note: namespace names should *not* end in  # ;
         the  # will get added during qname processing"""
@@ -427,6 +434,8 @@ class SinkParser:
         self._reason = why  # Why the parser was asked to parse this
 
         self.turtle = turtle  # raise exception when encountering N3 extensions
+        self.rdfstar = rdfstar  # allow Turtle-star quoted triples << s p o >>
+        self._quoted_depth = 0  # current quoted triple nesting depth
         # Turtle allows single or double quotes around strings, whereas N3
         # only allows double quotes.
         self.string_delimiters = ('"', "'") if turtle else ('"',)
@@ -870,6 +879,11 @@ class SinkParser:
             res.append(("->", Logic_NS + "becomes"))
             return i + 2
 
+        if argstr[i : i + 2] == "<<":
+            self.BadSyntax(
+                argstr, i, "quoted triple '<< ... >>' cannot be used as a predicate"
+            )
+
         j = self.prop(argstr, i, r)
         if j >= 0:
             res.append(("->", r[0]))
@@ -894,6 +908,11 @@ class SinkParser:
         j = self.nodeOrLiteral(argstr, i, res)
         if j < 0:
             return j  # nope
+
+        if self._quoted_depth > 0 and argstr[j] in {"!", "^"}:
+            self.BadSyntax(
+                argstr, j, "path syntax is not supported inside quoted triples"
+            )
 
         while argstr[j] in {"!", "^"}:  # no spaces, must follow exactly (?)
             ch = argstr[j]
@@ -938,7 +957,18 @@ class SinkParser:
         i = j
         ch = argstr[i]  # Quick 1-character checks first:
 
+        if ch == "<" and argstr[i + 1 : i + 2] == "<":
+            # Turtle-star quoted triple: << subject predicate object >>
+            return self.quotedTriple(argstr, i, res)
+
         if ch == "[":
+            if self._quoted_depth > 0:
+                self.BadSyntax(
+                    argstr,
+                    i,
+                    "blank node property lists are not supported "
+                    "inside quoted triples",
+                )
             bnodeID = self.here(i)
             j = self.skipSpace(argstr, i + 1)
             if j < 0:
@@ -985,6 +1015,10 @@ class SinkParser:
             return j + 1
 
         if not self.turtle and ch == "{":
+            if self._quoted_depth > 0:
+                self.BadSyntax(
+                    argstr, i, "formulas are not supported inside quoted triples"
+                )
             # if self.turtle:
             #     self.BadSyntax(argstr, i,
             #                     "found '{' while in Turtle mode, Formulas not supported!")
@@ -1062,6 +1096,12 @@ class SinkParser:
                 return j
 
         if ch == "(":
+            if self._quoted_depth > 0:
+                self.BadSyntax(
+                    argstr,
+                    i,
+                    "collections are not supported inside quoted triples",
+                )
             thing_type: Callable[
                 [list[Any], Optional[Formula]], Union[set[Any], IdentifiedNode]
             ]
@@ -1114,6 +1154,82 @@ class SinkParser:
                 return j
 
         return -1
+
+    def quotedTriple(self, argstr: str, i: int, res: MutableSequence[Any]) -> int:
+        """Parse a Turtle-star quoted triple: ``<< subject predicate object >>``.
+
+        The quoted triple is only referenced, never asserted: no triples are
+        added to the graph while parsing it. The predicate must be an IRI.
+        """
+        if not self.rdfstar:
+            self.BadSyntax(
+                argstr,
+                i,
+                "found '<<' quoted triple syntax, which is not supported "
+                "by this parser (use the turtlestar format instead)",
+            )
+        if self._quoted_depth >= self.max_quoted_depth:
+            self.BadSyntax(
+                argstr,
+                i,
+                "quoted triple nesting exceeds the maximum depth of %d"
+                % self.max_quoted_depth,
+            )
+        self._quoted_depth += 1
+        try:
+            j = self.skipSpace(argstr, i + 2)
+            if j < 0:
+                self.BadSyntax(argstr, i, "EOF found after '<<'")
+
+            subj: list[Any] = []
+            j = self.node(argstr, j, subj)
+            if j < 0:
+                self.BadSyntax(
+                    argstr, i, "expected subject of quoted triple after '<<'"
+                )
+            if not isinstance(subj[0], (URIRef, BNode, QuotedTriple)):
+                self.BadSyntax(
+                    argstr,
+                    i,
+                    "subject of quoted triple must be an IRI, blank node "
+                    "or quoted triple",
+                )
+
+            pred: list[Any] = []
+            k = self.skipSpace(argstr, j)
+            if k < 0:
+                self.BadSyntax(argstr, j, "EOF found, expected quoted triple predicate")
+            j = self.tok("a", argstr, k)
+            if j >= 0:
+                pred.append(self._store.newSymbol(RDF_type_URI))
+            else:
+                j = self.uri_ref2(argstr, k, pred)
+                if j < 0:
+                    self.BadSyntax(
+                        argstr, k, "expected predicate (IRI) of quoted triple"
+                    )
+            if not isinstance(pred[0], URIRef):
+                self.BadSyntax(
+                    argstr, k, "predicate of quoted triple must be an IRI"
+                )
+
+            obj: list[Any] = []
+            j = self.nodeOrLiteral(argstr, j, obj)
+            if j < 0:
+                self.BadSyntax(argstr, i, "expected object of quoted triple")
+
+            j = self.skipSpace(argstr, j)
+            if j < 0:
+                self.BadSyntax(
+                    argstr, i, "EOF found, expected '>>' to close quoted triple"
+                )
+            if argstr[j : j + 2] != ">>":
+                self.BadSyntax(argstr, j, "expected '>>' to close quoted triple")
+
+            res.append(QuotedTriple((subj[0], pred[0], obj[0])))
+            return j + 2
+        finally:
+            self._quoted_depth -= 1
 
     def property_list(self, argstr: str, i: int, subj: Node) -> int:
         """Parse property list
@@ -2031,6 +2147,7 @@ class TurtleParser(Parser):
         graph: Graph,
         encoding: Optional[str] = "utf-8",
         turtle: bool = True,
+        rdfstar: bool = False,
     ) -> None:
         if encoding not in [None, "utf-8"]:
             raise ParserError(
@@ -2040,7 +2157,7 @@ class TurtleParser(Parser):
         sink = RDFSink(graph)
 
         baseURI = graph.absolutize(source.getPublicId() or source.getSystemId() or "")
-        p = SinkParser(sink, baseURI=baseURI, turtle=turtle)
+        p = SinkParser(sink, baseURI=baseURI, turtle=turtle, rdfstar=rdfstar)
         # N3 parser prefers str stream
         stream: Reader[str] | Reader[bytes] | None = cast(
             "Reader[str]", source.getCharacterStream()
@@ -2053,6 +2170,33 @@ class TurtleParser(Parser):
 
         for prefix, namespace in p._bindings.items():
             graph.bind(prefix, namespace)
+
+
+class TurtleStarParser(TurtleParser):
+    """An RDFLib parser for Turtle-star.
+
+    Turtle-star is Turtle extended with the RDF-star quoted triple syntax
+    ``<< subject predicate object >>``, which refers to a triple without
+    asserting it. Quoted triples may appear in subject or object position
+    and may be nested up to a limited depth
+    (see :attr:`SinkParser.max_quoted_depth`); the predicate of a quoted
+    triple must be an IRI.
+
+    Only the explicitly asserted outer triples are added to the graph;
+    the content of quoted triples is never asserted.
+
+    Note that this first version only supports the quoted triple syntax
+    described above; it does not claim to cover all RDF 1.2 syntax.
+    """
+
+    def __init__(self):
+        pass
+
+    # type error: Signature of "parse" incompatible with supertype "TurtleParser"
+    def parse(  # type: ignore[override]
+        self, source: InputSource, graph: Graph, encoding: Optional[str] = "utf-8"
+    ) -> None:
+        TurtleParser.parse(self, source, graph, encoding, turtle=True, rdfstar=True)
 
 
 class N3Parser(TurtleParser):

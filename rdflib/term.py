@@ -36,6 +36,7 @@ __all__ = [
     "BNode",
     "Literal",
     "Variable",
+    "QuotedTriple",
 ]
 import logging
 import math
@@ -52,6 +53,7 @@ from types import GeneratorType
 from typing import (
     TYPE_CHECKING,
     Any,
+    Iterator,
     Optional,
     TypeVar,
     Union,
@@ -2362,12 +2364,139 @@ class Variable(Identifier):
         return (Variable, (str(self),))
 
 
+class QuotedTriple(Node):
+    """
+    An immutable RDF-star quoted triple: a triple that is referred to
+    (e.g. with Turtle-star ``<< s p o >>`` syntax) without being asserted
+    in the graph.
+
+    A ``QuotedTriple`` may appear in subject or object position of an
+    asserted triple, and may be nested inside another ``QuotedTriple``.
+    The predicate of a quoted triple must always be a valid IRI
+    (:class:`URIRef`).
+    """
+
+    __slots__ = ("_triple",)
+
+    def __init__(self, triple: tuple[Node, Node, Node]):
+        if len(triple) != 3:
+            raise ValueError(
+                "QuotedTriple must be given a 3-tuple of nodes, got: %r" % (triple,)
+            )
+        subject, predicate, object_ = triple
+        for position, node in zip(("subject", "predicate", "object"), triple):
+            if not isinstance(node, Node):
+                raise ValueError(
+                    "QuotedTriple %s must be an rdflib term, got: %r"
+                    % (position, node)
+                )
+        if not isinstance(predicate, URIRef):
+            raise ValueError(
+                "QuotedTriple predicate must be a URIRef (IRI), got: %r" % (predicate,)
+            )
+        object.__setattr__(self, "_triple", (subject, predicate, object_))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("QuotedTriple is immutable")
+
+    @property
+    def subject(self) -> Node:
+        return self._triple[0]
+
+    @property
+    def predicate(self) -> Node:
+        return self._triple[1]
+
+    @property
+    def object(self) -> Node:
+        return self._triple[2]
+
+    def __getitem__(self, index: int) -> Node:
+        return self._triple[index]
+
+    def __iter__(self) -> Iterator[Node]:
+        return iter(self._triple)
+
+    def __len__(self) -> int:
+        return 3
+
+    def __eq__(self, other: Any) -> bool:
+        if type(self) is type(other):
+            return self._triple == other._triple  # type: ignore[attr-defined]
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash((QuotedTriple, self._triple))
+
+    def __lt__(self, other: Any) -> bool:
+        if other is None:
+            return False
+        elif type(self) is type(other):
+            return self.n3() < other.n3()  # type: ignore[attr-defined]
+        elif isinstance(other, Node):
+            return _ORDERING[type(self)] < _ORDERING[type(other)]
+        return NotImplemented
+
+    def __gt__(self, other: Any) -> bool:
+        if other is None:
+            return True
+        elif type(self) is type(other):
+            return self.n3() > other.n3()  # type: ignore[attr-defined]
+        elif isinstance(other, Node):
+            return _ORDERING[type(self)] > _ORDERING[type(other)]
+        return NotImplemented
+
+    def __le__(self, other: Any) -> bool:
+        r = self.__lt__(other)
+        if r:
+            return True
+        return self == other
+
+    def __ge__(self, other: Any) -> bool:
+        r = self.__gt__(other)
+        if r:
+            return True
+        return self == other
+
+    def __repr__(self) -> str:
+        if self.__class__ is QuotedTriple:
+            cls_name = "rdflib.term.QuotedTriple"
+        else:
+            cls_name = self.__class__.__name__
+        return "%s((%r, %r, %r))" % (
+            cls_name,
+            self._triple[0],
+            self._triple[1],
+            self._triple[2],
+        )
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[QuotedTriple], tuple[tuple[Node, Node, Node]]]:
+        return (QuotedTriple, (self._triple,))
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        """Render as Turtle-star ``<< s p o >>`` syntax."""
+        subject, predicate, object_ = self._triple
+        return "<< %s %s %s >>" % (
+            subject.n3(namespace_manager),
+            predicate.n3(namespace_manager),
+            object_.n3(namespace_manager),
+        )
+
+    def toPython(self) -> QuotedTriple:  # noqa: N802
+        return self
+
+
 # Nodes are ordered like this
 # See http://www.w3.org/TR/sparql11-query/#modOrderBy
 # we leave "space" for more subclasses of Node elsewhere
 # default-dict to grazefully fail for new subclasses
 _ORDERING: dict[type[Node], int] = defaultdict(int)
-_ORDERING.update({BNode: 10, Variable: 20, URIRef: 30, Literal: 40})
+_ORDERING.update({QuotedTriple: 5, BNode: 10, Variable: 20, URIRef: 30, Literal: 40})
 
 
 def _isEqualXMLNode(  # noqa: N802

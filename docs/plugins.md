@@ -95,6 +95,7 @@ If you are not sure what format your file will be, you can use [`guess_format()`
 | nt      | [`NTParser`][rdflib.plugins.parsers.ntriples.NTParser]        |
 | trix    | [`TriXParser`][rdflib.plugins.parsers.trix.TriXParser]        |
 | turtle  | [`TurtleParser`][rdflib.plugins.parsers.notation3.TurtleParser] |
+| turtlestar | [`TurtleStarParser`][rdflib.plugins.parsers.notation3.TurtleStarParser] |
 | xml     | [`RDFXMLParser`][rdflib.plugins.parsers.rdfxml.RDFXMLParser]  |
 
 ### Multi-graph IDs
@@ -140,6 +141,7 @@ graph.serialize(my_url, format='application/rdf+xml')
 | trix | [`TriXSerializer`][rdflib.plugins.serializers.trix.TriXSerializer] |
 | turtle | [`TurtleSerializer`][rdflib.plugins.serializers.turtle.TurtleSerializer] |
 | longturtle | [`LongTurtleSerializer`][rdflib.plugins.serializers.longturtle.LongTurtleSerializer] |
+| turtlestar | [`TurtleStarSerializer`][rdflib.plugins.serializers.turtle.TurtleStarSerializer] |
 | xml | [`XMLSerializer`][rdflib.plugins.serializers.rdfxml.XMLSerializer] |
 
 ### JSON-LD
@@ -163,6 +165,20 @@ For context-aware (multi-graph) serialization, the 'graph' field of the default 
 Longturtle is just the turtle format with newlines preferred over compactness - multiple nodes on the same line to enhance the format's text file version control (think Git) friendliness - and more modern forms of prefix markers - PREFIX instead of @prefix - to make it as similar to SPARQL as possible.
 
 Longturtle is Turtle 1.1 compliant and will work wherever ordinary turtle works, however some very old parsers don't understand PREFIX, only @prefix...
+
+### Turtle-star
+
+Turtle-star - 'turtlestar' - is Turtle extended with the RDF-star quoted
+triple syntax `<< s p o >>`, which refers to a statement without asserting
+it. A quoted triple is represented by the immutable term
+[`QuotedTriple`][rdflib.term.QuotedTriple] and may appear in subject or
+object position, nested up to a limited depth
+(`SinkParser.max_quoted_depth`); the predicate of a quoted triple must be
+an IRI. Only the explicitly asserted outer triples are added to the graph -
+the content of quoted triples is never asserted.
+
+Note that this first version only supports the quoted triple syntax
+described above; it does not claim to cover all RDF 1.2 syntax.
 
 ## Plugin query results
 

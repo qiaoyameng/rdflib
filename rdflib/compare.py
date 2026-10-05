@@ -114,7 +114,7 @@ from typing import (
 )
 
 from rdflib.graph import ConjunctiveGraph, Graph, ReadOnlyGraphAggregate, _TripleType
-from rdflib.term import BNode, IdentifiedNode, Node, URIRef
+from rdflib.term import BNode, IdentifiedNode, Node, QuotedTriple, URIRef
 
 if TYPE_CHECKING:
     from _hashlib import HASH
@@ -293,9 +293,18 @@ class Color:
 _HashT = Callable[[], "HASH"]
 
 
+# Internal predicates used to expand quoted triples into a plain graph
+# for blank-node-aware canonicalization. Never present in user data.
+_QT_SUBJECT = URIRef("http://rdflib.net/rdfstar/quoted/subject")
+_QT_PREDICATE = URIRef("http://rdflib.net/rdfstar/quoted/predicate")
+_QT_OBJECT = URIRef("http://rdflib.net/rdfstar/quoted/object")
+
+
 class _TripleCanonicalizer:
     def __init__(self, graph: Graph, hashfunc: _HashT = sha256):
-        self.graph = graph
+        self._source_graph = graph
+        self._quoted_terms: dict[QuotedTriple, BNode] = {}
+        self.graph = self._expand_quoted_triples(graph)
 
         def _hashfunc(s: str):
             h = hashfunc()
@@ -304,6 +313,43 @@ class _TripleCanonicalizer:
 
         self._hash_cache: HashCache = {}
         self.hashfunc = _hashfunc
+
+    def _expand_quoted_triples(self, graph: Graph) -> Graph:
+        """Build a working copy of the graph where every quoted triple term
+        is replaced by a fresh blank node, linked to its (recursively
+        expanded) components with internal predicates. This lets the
+        canonicalization algorithm account for blank nodes that occur
+        inside quoted triples."""
+        if not any(
+            isinstance(term, QuotedTriple)
+            for triple in graph
+            for term in (triple[0], triple[2])
+        ):
+            return graph
+        expanded = Graph()
+        for s, p, o in graph:
+            expanded.add(
+                (self._expand_term(s, expanded), p, self._expand_term(o, expanded))
+            )
+        return expanded
+
+    def _expand_term(self, term: Node, expanded: Graph) -> Node:
+        if not isinstance(term, QuotedTriple):
+            return term
+        virtual = self._quoted_terms.get(term)
+        if virtual is None:
+            virtual = BNode()
+            self._quoted_terms[term] = virtual
+            expanded.add(
+                (virtual, _QT_SUBJECT, self._expand_term(term.subject, expanded))
+            )
+            expanded.add(
+                (virtual, _QT_PREDICATE, self._expand_term(term.predicate, expanded))
+            )
+            expanded.add(
+                (virtual, _QT_OBJECT, self._expand_term(term.object, expanded))
+            )
+        return virtual
 
     def _discrete(self, coloring: list[Color]) -> bool:
         return len([c for c in coloring if not c.discrete()]) == 0
@@ -526,7 +572,7 @@ class _TripleCanonicalizer:
             stats["canonicalize_triples_runtime"] = _total_seconds(
                 datetime.now() - start_coloring
             )
-        for triple in self.graph:
+        for triple in self._source_graph:
             result = tuple(self._canonicalize_bnodes(triple, bnode_labels))
             yield result
 
@@ -536,10 +582,18 @@ class _TripleCanonicalizer:
         labels: dict[Node, str],
     ):
         for term in triple:
-            if isinstance(term, BNode):
-                yield BNode(value="cb%s" % labels[term])
-            else:
-                yield term
+            yield self._canonicalize_term(term, labels)
+
+    def _canonicalize_term(self, term: Node, labels: dict[Node, str]) -> Node:
+        if isinstance(term, BNode):
+            return BNode(value="cb%s" % labels[term])
+        if isinstance(term, QuotedTriple):
+            return QuotedTriple(
+                tuple(  # type: ignore[arg-type]
+                    self._canonicalize_term(component, labels) for component in term
+                )
+            )
+        return term
 
 
 def to_isomorphic(graph: Graph) -> IsomorphicGraph:
