@@ -95,6 +95,7 @@ If you are not sure what format your file will be, you can use [`guess_format()`
 | nt      | [`NTParser`][rdflib.plugins.parsers.ntriples.NTParser]        |
 | trix    | [`TriXParser`][rdflib.plugins.parsers.trix.TriXParser]        |
 | turtle  | [`TurtleParser`][rdflib.plugins.parsers.notation3.TurtleParser] |
+| turtle-star | [`TurtleStarParser`][rdflib.plugins.parsers.turtlestar.TurtleStarParser] |
 | xml     | [`RDFXMLParser`][rdflib.plugins.parsers.rdfxml.RDFXMLParser]  |
 
 ### Multi-graph IDs
@@ -139,8 +140,22 @@ graph.serialize(my_url, format='application/rdf+xml')
 | trig | [`TrigSerializer`][rdflib.plugins.serializers.trig.TrigSerializer] |
 | trix | [`TriXSerializer`][rdflib.plugins.serializers.trix.TriXSerializer] |
 | turtle | [`TurtleSerializer`][rdflib.plugins.serializers.turtle.TurtleSerializer] |
+| turtle-star | [`TurtleStarSerializer`][rdflib.plugins.serializers.turtlestar.TurtleStarSerializer] |
 | longturtle | [`LongTurtleSerializer`][rdflib.plugins.serializers.longturtle.LongTurtleSerializer] |
 | xml | [`XMLSerializer`][rdflib.plugins.serializers.rdfxml.XMLSerializer] |
+
+### Turtle-star
+
+Turtle-star - 'turtle-star' - extends Turtle with quoted triples written
+`<< s p o >>`, so a statement can be referred to - for example to record the
+source of an unconfirmed fact - without asserting it. Quoted triples may
+appear in subject or object position and may be nested up to a limited,
+configurable depth (`max_quoted_depth`, default 8); a quoted triple's
+predicate must be an IRI. Only the outer, explicitly asserted triples are
+added to the graph: quoted content is represented by immutable
+[`QuotedTriple`][rdflib.term.QuotedTriple] terms and is never asserted as a
+side effect of parsing. Only this explicit quoted-triple syntax is
+supported; no other RDF 1.2 / RDF-star syntax is claimed to be covered.
 
 ### JSON-LD
 

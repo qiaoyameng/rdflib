@@ -114,7 +114,50 @@ from typing import (
 )
 
 from rdflib.graph import ConjunctiveGraph, Graph, ReadOnlyGraphAggregate, _TripleType
-from rdflib.term import BNode, IdentifiedNode, Node, URIRef
+from rdflib.term import BNode, IdentifiedNode, Node, QuotedTriple, URIRef
+
+# Marker predicates used to unfold quoted triple terms into plain triples so
+# that blank nodes inside quoted triples participate in blank node
+# canonicalization.  The markers only ever occur in the temporary expanded
+# graph, never in the source graph.
+_QT_MARKER_SUBJ = URIRef("urn:x-rdflib:compare:quoted-triple:subject")
+_QT_MARKER_PRED = URIRef("urn:x-rdflib:compare:quoted-triple:predicate")
+_QT_MARKER_OBJ = URIRef("urn:x-rdflib:compare:quoted-triple:object")
+
+
+def _expand_quoted_triples(graph: Graph) -> Graph:
+    """Return a graph suited for bnode canonicalization.
+
+    If ``graph`` contains `rdflib.term.QuotedTriple` terms, each distinct
+    quoted triple is unfolded into marker triples hanging off a fresh blank
+    node, so that blank nodes occurring inside quoted triples are taken into
+    account by the canonicalization algorithm.  Otherwise the graph is
+    returned unchanged.
+    """
+    for triple in graph:
+        if any(isinstance(term, QuotedTriple) for term in triple):
+            break
+    else:
+        return graph
+
+    expanded = Graph()
+    interned: dict[QuotedTriple, BNode] = {}
+
+    def expand_term(term: Node) -> Node:
+        if not isinstance(term, QuotedTriple):
+            return term
+        marker = interned.get(term)
+        if marker is None:
+            marker = BNode()
+            interned[term] = marker
+            expanded.add((marker, _QT_MARKER_SUBJ, expand_term(term.subject)))
+            expanded.add((marker, _QT_MARKER_PRED, expand_term(term.predicate)))
+            expanded.add((marker, _QT_MARKER_OBJ, expand_term(term.object)))
+        return marker
+
+    for s, p, o in graph:
+        expanded.add((expand_term(s), expand_term(p), expand_term(o)))
+    return expanded
 
 if TYPE_CHECKING:
     from _hashlib import HASH
@@ -295,7 +338,8 @@ _HashT = Callable[[], "HASH"]
 
 class _TripleCanonicalizer:
     def __init__(self, graph: Graph, hashfunc: _HashT = sha256):
-        self.graph = graph
+        self._source_graph = graph
+        self.graph = _expand_quoted_triples(graph)
 
         def _hashfunc(s: str):
             h = hashfunc()
@@ -526,7 +570,7 @@ class _TripleCanonicalizer:
             stats["canonicalize_triples_runtime"] = _total_seconds(
                 datetime.now() - start_coloring
             )
-        for triple in self.graph:
+        for triple in self._source_graph:
             result = tuple(self._canonicalize_bnodes(triple, bnode_labels))
             yield result
 
@@ -536,10 +580,18 @@ class _TripleCanonicalizer:
         labels: dict[Node, str],
     ):
         for term in triple:
-            if isinstance(term, BNode):
-                yield BNode(value="cb%s" % labels[term])
-            else:
-                yield term
+            yield self._canonicalize_term(term, labels)
+
+    def _canonicalize_term(self, term: Node, labels: dict[Node, str]) -> Node:
+        if isinstance(term, BNode):
+            return BNode(value="cb%s" % labels[term])
+        if isinstance(term, QuotedTriple):
+            return QuotedTriple(
+                tuple(  # type: ignore[arg-type]
+                    self._canonicalize_term(inner, labels) for inner in term
+                )
+            )
+        return term
 
 
 def to_isomorphic(graph: Graph) -> IsomorphicGraph:
@@ -639,4 +691,12 @@ def _squash_graph(graph: Graph):
 
 
 def _squash_bnodes(triple):
-    return tuple((isinstance(t, BNode) and _MOCK_BNODE) or t for t in triple)
+    return tuple(_squash_term(t) for t in triple)
+
+
+def _squash_term(term):
+    if isinstance(term, BNode):
+        return _MOCK_BNODE
+    if isinstance(term, QuotedTriple):
+        return QuotedTriple(tuple(_squash_term(inner) for inner in term))
+    return term

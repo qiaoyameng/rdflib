@@ -36,6 +36,7 @@ __all__ = [
     "BNode",
     "Literal",
     "Variable",
+    "QuotedTriple",
 ]
 import logging
 import math
@@ -515,6 +516,138 @@ class BNode(IdentifiedNode):
             basepath = rdflib_skolem_genid
         skolem = basepath + str(self)
         return URIRef(urljoin(authority, skolem))
+
+
+class QuotedTriple(Node):
+    """
+    An immutable RDF-star quoted triple term, as written ``<< s p o >>`` in
+    Turtle-star.
+
+    A `QuotedTriple` denotes a triple that is being *referred to* (quoted),
+    not asserted: a quoted triple may appear in subject or object position of
+    an asserted triple, but the triple it contains is not itself part of the
+    graph.
+
+    Instances are immutable and compare by value: two `QuotedTriple`
+    instances are equal if and only if their subject, predicate and object
+    are equal.
+
+    Note that this is an RDFLib extension term, first-class support is only
+    guaranteed by the ``turtle-star`` parser and serializer.
+    """
+
+    __slots__ = ("_triple",)
+
+    def __init__(self, triple: tuple[Node, Node, Node]):
+        if len(triple) != 3:
+            raise ValueError(
+                "QuotedTriple requires a 3-tuple of (subject, predicate, object)"
+            )
+        subject, predicate, object_ = triple
+        if not isinstance(subject, (URIRef, BNode, QuotedTriple)):
+            raise TypeError(
+                "QuotedTriple subject must be a URIRef, BNode or QuotedTriple, "
+                "got %r" % (subject,)
+            )
+        if not isinstance(predicate, URIRef):
+            raise TypeError(
+                "QuotedTriple predicate must be a URIRef, got %r" % (predicate,)
+            )
+        if not isinstance(object_, Node):
+            raise TypeError(
+                "QuotedTriple object must be an rdflib term, got %r" % (object_,)
+            )
+        object.__setattr__(self, "_triple", (subject, predicate, object_))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("QuotedTriple is immutable")
+
+    @property
+    def subject(self) -> Node:
+        return self._triple[0]
+
+    @property
+    def predicate(self) -> Node:
+        return self._triple[1]
+
+    @property
+    def object(self) -> Node:  # noqa: A003
+        return self._triple[2]
+
+    def __getitem__(self, index: int) -> Node:
+        return self._triple[index]
+
+    def __iter__(self) -> Generator[Node, None, None]:
+        return iter(self._triple)
+
+    def __len__(self) -> int:
+        return 3
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, QuotedTriple):
+            return self._triple == other._triple
+        return NotImplemented
+
+    def __ne__(self, other: Any) -> bool:
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __lt__(self, other: Any) -> bool:
+        if isinstance(other, QuotedTriple):
+            return self._sort_key() < other._sort_key()
+        if isinstance(other, Node):
+            # QuotedTriple terms sort after all string-based terms.
+            return False
+        return NotImplemented
+
+    def __le__(self, other: Any) -> bool:
+        if isinstance(other, QuotedTriple):
+            return self._sort_key() <= other._sort_key()
+        if isinstance(other, Node):
+            return False
+        return NotImplemented
+
+    def __gt__(self, other: Any) -> bool:
+        if isinstance(other, QuotedTriple):
+            return self._sort_key() > other._sort_key()
+        if isinstance(other, Node):
+            return True
+        return NotImplemented
+
+    def __ge__(self, other: Any) -> bool:
+        if isinstance(other, QuotedTriple):
+            return self._sort_key() >= other._sort_key()
+        if isinstance(other, Node):
+            return True
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((QuotedTriple, self._triple))
+
+    def _sort_key(self) -> str:
+        return self.n3()
+
+    def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+        return "<< %s %s %s >>" % (
+            self.subject.n3(namespace_manager),
+            self.predicate.n3(namespace_manager),
+            self.object.n3(namespace_manager),
+        )
+
+    def toPython(self) -> QuotedTriple:  # noqa: N802
+        return self
+
+    def __reduce__(self) -> tuple[type[QuotedTriple], tuple[tuple[Node, Node, Node]]]:
+        return (QuotedTriple, (self._triple,))
+
+    def __repr__(self) -> str:
+        if self.__class__ is QuotedTriple:
+            clsName = "rdflib.term.QuotedTriple"  # noqa: N806
+        else:
+            clsName = self.__class__.__name__  # noqa: N806
+        return f"{clsName}({self._triple!r})"
 
 
 class Literal(Identifier):
