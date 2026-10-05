@@ -9,7 +9,156 @@ from rdflib.term import BNode, Node
 if TYPE_CHECKING:
     from rdflib.graph import Graph
 
-__all__ = ["Collection"]
+__all__ = ["Collection", "replace_range"]
+
+
+def replace_range(
+    graph: Graph,
+    head: Node,
+    start: int,
+    end: int,
+    replacement: Iterable[Node],
+) -> Node:
+    """Replace the half-open range ``[start, end)`` in an RDF collection.
+
+    The original collection is never destructively spliced through a node that
+    may be referenced by another collection or another triple. Cells on the
+    edited prefix that have another incoming reference are copied, while cells
+    before that point retain their identity. Cells removed from the new
+    collection are left intact when retaining them is necessary to preserve an
+    existing reference; otherwise only their ``rdf:first`` and ``rdf:rest``
+    triples are removed.
+
+    The collection is read and validated before any triples are written. A
+    cycle, more than one ``rdf:first`` or ``rdf:rest`` value, or a missing
+    ``rdf:first``/``rdf:rest`` value therefore leaves the graph unchanged.
+
+    Args:
+        graph: Graph containing the collection.
+        head: First collection cell, or ``RDF.nil`` for the empty list.
+        start: Start position of the range to replace (inclusive).
+        end: End position of the range to replace (exclusive).
+        replacement: Items that replace the removed range.
+
+    Returns:
+        The head of the resulting collection.
+    """
+    if not isinstance(head, Node):
+        raise TypeError("head must be an RDF term")
+    if not isinstance(start, int) or not isinstance(end, int):
+        raise TypeError("start and end must be integers")
+
+    replacement_items = list(replacement)
+    for item in replacement_items:
+        if not isinstance(item, Node):
+            raise TypeError("replacement items must be RDF terms")
+
+    cells = _read_collection_cells(graph, head)
+    length = len(cells)
+    if start < 0 or end < 0 or start > length or end > length or start > end:
+        raise IndexError("invalid collection range")
+
+    external_references = [
+        _external_reference_count(graph, cell, cells[index - 1][0] if index else None)
+        for index, (cell, _, _) in enumerate(cells)
+    ]
+
+    copy_from: Optional[int] = None
+    if start > 0:
+        for index in range(start):
+            if external_references[index]:
+                copy_from = index
+                break
+
+    suffix = cells[end][0] if end < length else RDF.nil
+    replacement_head = _build_chain(graph, replacement_items, suffix)
+
+    if start > 0:
+        copied_prefix: dict[int, BNode] = {}
+        if copy_from is not None:
+            for index in range(start - 1, copy_from - 1, -1):
+                copied_cell = BNode()
+                next_cell = copied_prefix.get(index + 1, replacement_head)
+                graph.add((copied_cell, RDF.first, cells[index][1]))
+                graph.add((copied_cell, RDF.rest, next_cell))
+                copied_prefix[index] = copied_cell
+
+            if copy_from == 0:
+                new_head: Node = copied_prefix[0]
+            else:
+                new_head = head
+                _set_rest(graph, cells[copy_from - 1][0], copied_prefix[copy_from])
+        else:
+            new_head = head
+            _set_rest(graph, cells[start - 1][0], replacement_head)
+    else:
+        new_head = replacement_head
+
+    if copy_from is not None:
+        cleanup_end = start
+    else:
+        cleanup_end = end
+        for index in range(start, end):
+            if external_references[index]:
+                cleanup_end = index
+                break
+        for index in range(start, cleanup_end):
+            cell = cells[index][0]
+            graph.remove((cell, RDF.first, None))
+            graph.remove((cell, RDF.rest, None))
+
+    return new_head
+
+
+def _read_collection_cells(
+    graph: Graph, head: Node
+) -> list[tuple[Node, Node, Node]]:
+    cells: list[tuple[Node, Node, Node]] = []
+    current = head
+    seen: set[Node] = set()
+
+    while current != RDF.nil:
+        if current in seen:
+            raise ValueError("Malformed RDF collection: cyclic rdf:rest reference")
+        seen.add(current)
+
+        first_values = list(graph.objects(current, RDF.first))
+        rest_values = list(graph.objects(current, RDF.rest))
+        if len(first_values) != 1:
+            raise ValueError("Malformed RDF collection: expected exactly one rdf:first")
+        if len(rest_values) != 1:
+            raise ValueError("Malformed RDF collection: expected exactly one rdf:rest")
+
+        first_value = first_values[0]
+        rest_value = rest_values[0]
+        cells.append((current, first_value, rest_value))
+        current = rest_value
+
+    return cells
+
+
+def _external_reference_count(
+    graph: Graph, node: Node, predecessor: Optional[Node]
+) -> int:
+    return sum(
+        1
+        for subject, predicate in graph.subject_predicates(node)
+        if subject != predecessor or predicate != RDF.rest
+    )
+
+
+def _build_chain(graph: Graph, items: list[Node], terminal: Node) -> Node:
+    cells = [BNode() for _ in items]
+    for index, item in enumerate(items):
+        next_cell = cells[index + 1] if index + 1 < len(cells) else terminal
+        graph.add((cells[index], RDF.first, item))
+        graph.add((cells[index], RDF.rest, next_cell))
+    return cells[0] if cells else terminal
+
+
+def _set_rest(graph: Graph, cell: Node, next_cell: Node) -> None:
+    graph.remove((cell, RDF.rest, None))
+    graph.add((cell, RDF.rest, next_cell))
 
 
 class Collection:
@@ -59,6 +208,13 @@ class Collection:
         self.uri = uri or BNode()
         if seq:
             self += seq
+
+    def replace_range(
+        self, start: int, end: int, replacement: Iterable[Node]
+    ) -> Node:
+        """Safely replace a positional range and return the new head."""
+        self.uri = replace_range(self.graph, self.uri, start, end, replacement)
+        return self.uri
 
     def n3(self) -> str:
         """
