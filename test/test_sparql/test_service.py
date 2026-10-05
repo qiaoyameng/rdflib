@@ -377,14 +377,26 @@ def test_with_mock(
     function_httpmock.responses[MethodName.GET].append(mock_response)
     function_httpmock.responses[MethodName.POST].append(mock_response)
 
-    checker = OutcomeChecker[Sequence[Mapping[Variable, Identifier]]].from_primitive(
-        [{Variable("var"): item} for item in expected_result]
-        if isinstance(expected_result, list)
-        else expected_result
-    )
-    with checker.context():
+    if isinstance(expected_result, list):
         bindings = graph.query(query).bindings
-        checker.check(bindings)
+        # Blank nodes returned by a SERVICE call are scoped to that call, so
+        # the value keeps the remote label as a suffix rather than equal it.
+        assert len(bindings) == len(expected_result)
+        for binding, expected in zip(bindings, expected_result):
+            value = binding[Variable("var")]
+            if isinstance(expected, BNode):
+                assert isinstance(value, BNode)
+                assert str(value).endswith(str(expected))
+                assert str(value) != str(expected)
+            else:
+                assert value == expected
+    else:
+        checker = OutcomeChecker[
+            Sequence[Mapping[Variable, Identifier]]
+        ].from_primitive(expected_result)
+        with checker.context():
+            bindings = graph.query(query).bindings
+            checker.check(bindings)
 
 
 if __name__ == "__main__":

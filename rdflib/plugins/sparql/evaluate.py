@@ -18,10 +18,11 @@ from __future__ import annotations
 import collections
 import itertools
 import re
-from collections.abc import Generator, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     Optional,
     Union,
 )
@@ -66,6 +67,32 @@ except ImportError:
     _HAS_ORJSON = False
 
 _Triple = tuple[Identifier, Identifier, Identifier]
+
+#: Maximum number of outer rows whose binding patterns are handed to one
+#: remote SERVICE query by the bound-join strategy.
+SERVICE_BOUND_JOIN_BATCH_SIZE = 20
+
+#: Monotonic counter used to scope blank nodes per remote call and to mint
+#: unique marker variable names.
+_SERVICE_CALL_COUNTER = itertools.count(1)
+
+#: Matches SERVICE [SILENT] <endpoint> { ... } against the original query
+#: text (the fragment body is matched greedily up to the final brace).
+_SERVICE_STRING_RE = re.compile(
+    r"^service(?:\s+silent)?[ \n]*<(?P<url>[^>]*)>[ \n]*{(?P<body>.*)}[ \n]*$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+class BoundServiceJoinPlan(NamedTuple):
+    """Static information for a bound-join SERVICE evaluation."""
+
+    url: str
+    prologue: str
+    raw_fragment: str
+    silent: bool
+    inner_vars: frozenset[Variable]
+    send_vars: frozenset[Variable]
 
 
 def evalBGP(
@@ -152,6 +179,12 @@ def evalJoin(ctx: QueryContext, join: CompValue) -> Generator[FrozenDict, None, 
     # only ever for join.p1
 
     if join.lazy:
+        # A SERVICE pattern with a fixed endpoint can be evaluated as an
+        # explicit bound-join: a small batch of compatible outer bindings is
+        # handed to one remote query instead of one query per outer row.
+        service_join = _boundServiceJoinPlan(ctx, join.p2)
+        if service_join is not None:
+            return evalBoundServiceJoin(ctx, join.p1, service_join)
         return evalLazyJoin(ctx, join)
     else:
         a = evalPart(ctx, join.p1)
@@ -335,64 +368,145 @@ def evalPart(ctx: QueryContext, part: CompValue) -> Any:
 
 
 def evalServiceQuery(ctx: QueryContext, part: CompValue):
-    res = {}
-    match = re.match(
-        "^service <(.*)>[ \n]*{(.*)}[ \n]*$",
+    """Reference (per-outer-row) evaluation path for a SERVICE pattern.
+
+    The pattern is executed once with the bindings currently visible in the
+    context.  See :func:`evalBoundServiceJoin` for the batched bound-join
+    variant used by the join evaluator.
+    """
+    plan = _servicePlan(part)
+    if plan is None:
+        # A variable endpoint (SERVICE ?ep ...) cannot be reached from the
+        # service string, so there is nothing to evaluate here.
+        return
+
+    service_url, fragment, silent, _inner_vars = plan
+    service_query = _buildQueryStringForServiceCall(ctx, fragment)
+
+    try:
+        yield from _runServiceOnce(ctx, service_url, service_query, silent=silent)
+    except _ServiceSilentFailure:
+        return
+
+
+def _runServiceOnce(
+    ctx: QueryContext,
+    service_url: str,
+    service_query: str,
+    silent: bool,
+    scope_bnodes: bool = True,
+) -> Generator[FrozenBindings, None, None]:
+    """Execute a single remote query and yield the solutions.
+
+    Blank nodes returned in a response are local to that particular call:
+    labels shared by two different responses must not identify the same
+    blank node.  ``scope_bnodes`` enables per-call relabelling (as required
+    by SPARQL 1.1 federation semantics).
+
+    On transport failure, SERVICE SILENT produces no solutions while a plain
+    SERVICE propagates the error.
+    """
+    try:
+        variables, results = service_transport(service_url, service_query)
+    except Exception:
+        if silent:
+            # Signal the SILENT failure to the caller: per the spec a failed
+            # SERVICE SILENT leaves the outer solutions in place.  A service
+            # that simply returns zero solutions yields nothing instead.
+            raise _ServiceSilentFailure
+        raise
+
+    bnode_prefix = _freshBNodeScopePrefix() if scope_bnodes else ""
+    for r in results:
+        for bound in _yieldBindingsFromServiceCallResult(
+            ctx, r, variables, bnode_prefix
+        ):
+            yield bound
+
+
+class _ServiceSilentFailure(Exception):
+    """Internal signal that a SERVICE SILENT remote call failed."""
+
+
+def _freshBNodeScopePrefix() -> str:
+    return "srv%d_" % next(_SERVICE_CALL_COUNTER)
+
+
+def _defaultServiceTransport(
+    service_url: str, service_query: str
+) -> tuple[list[str], list[dict[str, dict[str, str]]]]:
+    """HTTP transport used for SERVICE calls.
+
+    Returns the list of result variables and the raw JSON binding rows.
+    Raises on any transport error or non-OK HTTP status.
+    """
+    query_settings = {"query": service_query, "output": "json"}
+    headers = {
+        "accept": "application/sparql-results+json",
+        "user-agent": "rdflibForAnUser",
+    }
+    # GET is easier to cache so prefer that if the query is not to long
+    if len(service_query) < 600:
+        response = urlopen(
+            Request(service_url + "?" + urlencode(query_settings), headers=headers)
+        )
+    else:
+        response = urlopen(
+            Request(
+                service_url,
+                data=urlencode(query_settings).encode(),
+                headers=headers,
+            )
+        )
+    if response.status != 200:
+        raise Exception(
+            "Service: %s responded with code: %s" % (service_url, response.status)
+        )
+    if _HAS_ORJSON:
+        json_dict = orjson.loads(response.read())
+    else:
+        json_dict = json.loads(response.read())
+    return json_dict["head"]["vars"], json_dict["results"]["bindings"]
+
+
+# Transport used for all SERVICE requests.  May be replaced (for example with
+# an injected fake transport) for testing.  It receives the endpoint URL and
+# the serialized SPARQL query and returns (variables, raw-json-bindings).
+service_transport: Callable[
+    [str, str], tuple[list[str], list[dict[str, dict[str, str]]]]
+] = _defaultServiceTransport
+
+
+def _servicePlan(
+    part: CompValue,
+) -> Optional[tuple[str, str, bool, frozenset[Variable]]]:
+    """Extract (url, fragment, silent, inner-variables) from a SERVICE part.
+
+    Only fixed-IRI endpoints are usable.  The inner fragment is taken from the
+    original query text so it can be safely embedded in a fresh query.
+    """
+    match = _SERVICE_STRING_RE.match(
         # type error: Argument 2 to "get" of "CompValue" has incompatible type "str"; expected "bool"  [arg-type]
-        part.get("service_string", ""),  # type: ignore[arg-type]
-        re.DOTALL | re.I,
+        part.get("service_string", "")  # type: ignore[arg-type]
     )
-
-    if match:
-        service_url = match.group(1)
-        service_query = _buildQueryStringForServiceCall(ctx, match.group(2))
-
-        query_settings = {"query": service_query, "output": "json"}
-        headers = {
-            "accept": "application/sparql-results+json",
-            "user-agent": "rdflibForAnUser",
-        }
-        # GET is easier to cache so prefer that if the query is not to long
-        if len(service_query) < 600:
-            response = urlopen(
-                Request(service_url + "?" + urlencode(query_settings), headers=headers)
-            )
-        else:
-            response = urlopen(
-                Request(
-                    service_url,
-                    data=urlencode(query_settings).encode(),
-                    headers=headers,
-                )
-            )
-        if response.status == 200:
-            if _HAS_ORJSON:
-                json_dict = orjson.loads(response.read())
-            else:
-                json_dict = json.loads(response.read())
-            variables = res["vars_"] = json_dict["head"]["vars"]
-            # or just return the bindings?
-            res = json_dict["results"]["bindings"]
-            if len(res) > 0:
-                for r in res:
-                    # type error: Argument 2 to "_yieldBindingsFromServiceCallResult" has incompatible type "str"; expected "dict[str, dict[str, str]]"
-                    for bound in _yieldBindingsFromServiceCallResult(ctx, r, variables):
-                        yield bound
-        else:
-            raise Exception(
-                "Service: %s responded with code: %s", service_url, response.status
-            )
+    if not match:
+        return None
+    service_url = match.group("url")
+    fragment = match.group("body").strip()
+    # CompValue.get() returns the key itself when the key is absent, so the
+    # presence of the key is the only reliable test for the SILENT modifier.
+    silent = "silent" in part
+    inner_vars = frozenset(part.graph.get("_vars", set()))
+    return service_url, fragment, silent, inner_vars
 
 
-"""
+def _buildQueryStringForServiceCall(ctx: QueryContext, service_query: str) -> str:
+    """
     Build a query string to be used by the service call.
     It is supposed to pass in the existing bound solutions.
     Re-adds prefixes if added and sets the base.
     Wraps it in select if needed.
-"""
-
-
-def _buildQueryStringForServiceCall(ctx: QueryContext, service_query: str) -> str:
+    """
     try:
         parser.parseQuery(service_query)
     except ParseException:
@@ -416,8 +530,232 @@ def _buildQueryStringForServiceCall(ctx: QueryContext, service_query: str) -> st
     return service_query
 
 
+def _boundServiceJoinPlan(
+    ctx: QueryContext, part: CompValue
+) -> Optional[BoundServiceJoinPlan]:
+    """Prepare the bound-join batch strategy for a SERVICE join, if safe.
+
+    Only SERVICE fragments that are plain group graph patterns which parse
+    once embedded in a SELECT (using the outer query's prefixes/base) are
+    eligible.  Variable endpoints, self-contained SELECT subqueries and any
+    other fragment that cannot be rewritten this way fall back to the per-row
+    reference path.
+    """
+    if part.name != "ServiceGraphPattern":
+        return None
+    if not isinstance(part.get("term"), URIRef):
+        return None
+
+    plan = _servicePlan(part)
+    if plan is None:
+        return None
+    service_url, fragment, silent, inner_vars = plan
+
+    # A group containing a sub-SELECT may hide variables from the outer
+    # scope; an outer VALUES clause could then fail to constrain the service
+    # results, so such fragments are not considered safely rewritable.
+    if re.search(r"\bSELECT\b", fragment, flags=re.IGNORECASE):
+        return None
+
+    send_vars = frozenset(var for var in inner_vars if isinstance(var, Variable))
+
+    prologue = _servicePrologue(ctx)
+    try:
+        parser.parseQuery(prologue + "SELECT * WHERE {" + fragment + "}")
+    except ParseException:
+        return None
+
+    return BoundServiceJoinPlan(
+        url=service_url,
+        prologue=prologue,
+        raw_fragment=fragment,
+        silent=silent,
+        inner_vars=inner_vars,
+        send_vars=send_vars,
+    )
+
+
+def _servicePrologue(ctx: QueryContext) -> str:
+    prologue = ""
+    # type error: Item "None" of "Optional[Prologue]" has no attribute "namespace_manager"
+    for prefix, namespace in ctx.prologue.namespace_manager.store.namespaces():  # type: ignore[union-attr]
+        prologue += "PREFIX " + prefix + ":" + namespace.n3() + " "
+    # type error: Item "None" of "Optional[Prologue]" has no attribute "base"
+    base = ctx.prologue.base  # type: ignore[union-attr]
+    if base is not None and len(base) > 0:
+        prologue += "BASE <" + base + "> "
+    return prologue
+
+
+def evalBoundServiceJoin(
+    ctx: QueryContext,
+    p1: CompValue,
+    plan: BoundServiceJoinPlan,
+) -> Generator[FrozenBindings, None, None]:
+    """Bound-join: send small batches of compatible outer bindings per request.
+
+    Rows whose shared variables are bound to blank nodes cannot be shipped to
+    the remote endpoint (blank node labels are not shared between graphs);
+    those rows take the per-row reference path.  All other rows are grouped
+    into batches of at most ``SERVICE_BOUND_JOIN_BATCH_SIZE`` rows; their
+    distinct binding patterns are sent in one remote query and multiplicities
+    of the outer multiset are preserved by the local join.  SERVICE SILENT
+    uses one request per row so that a failed call can suppress the service
+    solutions for precisely the corresponding outer row.
+    """
+    outer_rows = list(evalPart(ctx, p1))
+
+    legacy_rows: list[FrozenBindings] = []
+    batchable_rows: list[FrozenBindings] = []
+    for row in outer_rows:
+        if any(
+            var in plan.send_vars and isinstance(row.get(var), BNode)
+            for var in row
+            if isinstance(var, Variable)
+        ):
+            legacy_rows.append(row)
+        else:
+            batchable_rows.append(row)
+
+    for row in legacy_rows:
+        row_ctx = ctx.thaw(row)
+        service_query = _buildQueryStringForServiceCall(row_ctx, plan.raw_fragment)
+        try:
+            for inner in _runServiceOnce(
+                row_ctx, plan.url, service_query, silent=plan.silent
+            ):
+                yield inner.merge(row)
+        except _ServiceSilentFailure:
+            # The outer row survives with the service variables unbound.
+            yield row
+
+    if not batchable_rows:
+        return
+
+    send_vars = sorted(plan.send_vars, key=str)
+
+    # The marker identifies which VALUES tuple of a batch a remote solution
+    # matches, so solutions cannot be attributed to the wrong outer row
+    # (unbound variables or differing bindings) and multiplicities stay
+    # exact.
+    marker = Variable("__rdflib_service_boundjoin_%d" % next(_SERVICE_CALL_COUNTER))
+    while marker in plan.inner_vars:
+        marker = Variable(
+            "__rdflib_service_boundjoin_%d" % next(_SERVICE_CALL_COUNTER)
+        )
+
+    # With SERVICE SILENT a transport failure must only suppress the
+    # service-side solutions for exactly the outer row of that call, so rows
+    # cannot be grouped into one request: fall back to one request per row.
+    batch_size = 1 if plan.silent else SERVICE_BOUND_JOIN_BATCH_SIZE
+
+    for start in range(0, len(batchable_rows), batch_size):
+        chunk = batchable_rows[start : start + batch_size]
+        yield from _evalServiceBatch(ctx, chunk, plan, send_vars, marker)
+
+
+def _evalServiceBatch(
+    ctx: QueryContext,
+    chunk: list[FrozenBindings],
+    plan: BoundServiceJoinPlan,
+    send_vars: list[Variable],
+    marker: Variable,
+) -> Generator[FrozenBindings, None, None]:
+    # Only the distinct binding patterns of the chunk are sent as VALUES
+    # tuples; each pattern is tagged with a marker literal so the remote
+    # solutions can be attributed back to the exact outer rows exhibiting
+    # that pattern.  Duplicate outer rows (same binding twice) are restored
+    # by the local join below, preserving the multiset multiplicity.
+    row_patterns: list[tuple[tuple[tuple[Variable, Identifier], ...], Literal]] = []
+    patterns: dict[Literal, dict[Variable, Identifier]] = {}
+    pattern_by_key: dict[
+        tuple[tuple[Variable, Identifier], ...], Literal
+    ] = {}
+    for row in chunk:
+        pattern = {
+            var: value
+            for var in send_vars
+            if (value := row.get(var)) is not None
+            and not isinstance(value, BNode)
+        }
+        key = tuple(sorted(pattern.items(), key=lambda item: str(item[0])))
+        marker_value = pattern_by_key.get(key)
+        if marker_value is None:
+            marker_value = Literal("m%d" % len(patterns))
+            pattern_by_key[key] = marker_value
+            patterns[marker_value] = pattern
+        row_patterns.append((key, marker_value))
+
+    values_header = marker.n3() + " " + " ".join(var.n3() for var in send_vars)
+    values_rows = []
+    for marker_value, pattern in patterns.items():
+        values_rows.append(
+            "("
+            + marker_value.n3()
+            + " "
+            + " ".join(
+                pattern[var].n3() if var in pattern else "UNDEF" for var in send_vars
+            )
+            + ")"
+        )
+    values_clause = "VALUES (" + values_header + ") {" + " ".join(values_rows) + "}"
+
+    service_query = (
+        plan.prologue
+        + "SELECT * WHERE { "
+        + values_clause
+        + " { "
+        + plan.raw_fragment
+        + " } }"
+    )
+
+    try:
+        variables, results = service_transport(plan.url, service_query)
+    except Exception:
+        if plan.silent:
+            # SERVICE SILENT: per the spec the join of a failed service call
+            # leaves the outer solutions in place with the service variables
+            # unbound, rather than dropping the whole batch of outer rows.
+            # The remaining batches are still evaluated.
+            yield from chunk
+            return
+        raise
+
+    bnode_prefix = _freshBNodeScopePrefix()
+    remote_solutions: list[FrozenBindings] = []
+    for r in results:
+        for inner in _yieldBindingsFromServiceCallResult(
+            ctx, r, variables, bnode_prefix
+        ):
+            remote_solutions.append(inner)
+
+    for row, (_key, row_marker) in zip(chunk, row_patterns):
+        for inner in remote_solutions:
+            # A solution belongs to this outer row only if it carries the
+            # marker of that row's own VALUES tuple.  This also makes the
+            # local check immune to unbound variables or differing bindings
+            # of other rows in the batch.
+            if inner.get(marker) != row_marker:
+                continue
+            # Drop the marker variable again, it is not part of the query.
+            yield FrozenBindings(
+                ctx,
+                itertools.chain(
+                    row.items(),
+                    (
+                        (key, value)
+                        for key, value in inner.items()
+                        if key != marker
+                    ),
+                ),
+            )
+
+
 def _yieldBindingsFromServiceCallResult(
-    ctx: QueryContext, r: dict[str, dict[str, str]], variables: list[str]
+    ctx: QueryContext,
+    r: dict[str, dict[str, str]],
+    variables: list[str],
+    bnode_prefix: str = "",
 ) -> Generator[FrozenBindings, None, None]:
     res_dict: dict[Variable, Identifier] = {}
     for var in variables:
@@ -439,7 +777,7 @@ def _yieldBindingsFromServiceCallResult(
                     var_binding["value"], datatype=URIRef(var_binding["datatype"])
                 )
             elif var_type == "bnode":
-                res_dict[Variable(var)] = BNode(var_binding["value"])
+                res_dict[Variable(var)] = BNode(bnode_prefix + var_binding["value"])
             else:
                 raise ValueError(f"invalid type {var_type!r} for variable {var!r}")
     yield FrozenBindings(ctx, res_dict)
