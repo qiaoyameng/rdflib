@@ -4,12 +4,213 @@ from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Optional
 
 from rdflib.namespace import RDF
-from rdflib.term import BNode, Node
+from rdflib.term import BNode, Node, URIRef
 
 if TYPE_CHECKING:
     from rdflib.graph import Graph
 
-__all__ = ["Collection"]
+__all__ = ["Collection", "MalformedCollectionError", "replace_range"]
+
+
+class MalformedCollectionError(ValueError):
+    """Raised when an RDF collection is not a well-formed linked list."""
+
+
+def _ensure_nil_is_terminal(graph: Graph) -> None:
+    has_nil_first = next(graph.triples((RDF.nil, RDF.first, None)), None)
+    has_nil_rest = next(graph.triples((RDF.nil, RDF.rest, None)), None)
+    if has_nil_first is not None or has_nil_rest is not None:
+        raise MalformedCollectionError("rdf:nil must not be used as a list node")
+
+
+def _read_collection(graph: Graph, head: Node) -> list[tuple[Node, Node, Node]]:
+    if not isinstance(head, Node):
+        raise TypeError("list head must be an rdflib Node")
+
+    if head == RDF.nil:
+        _ensure_nil_is_terminal(graph)
+        return []
+
+    if not isinstance(head, (BNode, URIRef)):
+        raise MalformedCollectionError(
+            "RDF collection nodes must be BNodes or URIRefs"
+        )
+
+    chain: list[tuple[Node, Node, Node]] = []
+    seen: set[Node] = set()
+    current: Node = head
+
+    while current != RDF.nil:
+        if current in seen:
+            raise MalformedCollectionError("RDF collection contains a cycle")
+        seen.add(current)
+
+        first_values = set(graph.objects(current, RDF.first))
+        rest_values = set(graph.objects(current, RDF.rest))
+        if len(first_values) != 1 or len(rest_values) != 1:
+            raise MalformedCollectionError(
+                "RDF collection node must have exactly one rdf:first and rdf:rest"
+            )
+
+        first = next(iter(first_values))
+        rest = next(iter(rest_values))
+        if not isinstance(rest, (BNode, URIRef)):
+            raise MalformedCollectionError("rdf:rest must identify another list node")
+
+        chain.append((current, first, rest))
+        current = rest
+
+    _ensure_nil_is_terminal(graph)
+    return chain
+
+
+def _has_external_reference(
+    graph: Graph, node: Node, predecessor: Optional[Node]
+) -> bool:
+    for subject, predicate, _ in graph.triples((None, None, node)):
+        if predicate != RDF.rest or predecessor is None or subject != predecessor:
+            return True
+    return False
+
+
+def _copy_non_collection_properties(
+    graph: Graph, old_node: Node, new_node: Node
+) -> None:
+    for _, predicate, object_ in graph.triples((old_node, None, None)):
+        if predicate not in (RDF.first, RDF.rest):
+            graph.add((new_node, predicate, object_))
+
+
+def replace_range(
+    graph: Graph,
+    head: Node,
+    start: int,
+    stop: int,
+    replacement: Iterable[Node],
+) -> Node:
+    """Replace the half-open range ``[start, stop)`` in an RDF collection.
+
+    The original linked-list structure is left intact wherever another list or
+    another triple references a node that must change. Unreachable list cells
+    have only their ``rdf:first`` and ``rdf:rest`` triples removed, so unrelated
+    business properties are preserved.
+    """
+    if not isinstance(start, int) or isinstance(start, bool):
+        raise TypeError("start must be an integer")
+    if not isinstance(stop, int) or isinstance(stop, bool):
+        raise TypeError("stop must be an integer")
+    if start < 0 or stop < 0 or start > stop:
+        raise ValueError("expected 0 <= start <= stop")
+
+    values = tuple(replacement)
+    for value in values:
+        if not isinstance(value, Node):
+            raise TypeError("replacement values must be rdflib Nodes")
+
+    chain = _read_collection(graph, head)
+    length = len(chain)
+    if stop > length:
+        raise IndexError("range extends beyond the RDF collection")
+    if start == stop and not values:
+        return head
+
+    external_references = [
+        _has_external_reference(
+            graph,
+            node,
+            chain[index - 1][0] if index > 0 else None,
+        )
+        for index, (node, _, _) in enumerate(chain)
+    ]
+
+    tail = chain[stop][0] if stop < length else RDF.nil
+    first_referenced_range_node: Optional[int] = next(
+        (
+            index
+            for index in range(start, stop)
+            if external_references[index]
+        ),
+        None,
+    )
+    replacement_nodes: list[Node] = []
+    for index, _ in enumerate(values):
+        old_index = start + index
+        if (
+            old_index < stop
+            and (
+                first_referenced_range_node is None
+                or old_index < first_referenced_range_node
+            )
+        ):
+            replacement_nodes.append(chain[old_index][0])
+        else:
+            new_node = BNode()
+            if old_index < stop:
+                _copy_non_collection_properties(graph, chain[old_index][0], new_node)
+            replacement_nodes.append(new_node)
+    replacement_head = replacement_nodes[0] if replacement_nodes else tail
+
+    copied_prefix_start: Optional[int] = None
+    copied_prefix_nodes: list[BNode] = []
+    if start > 0:
+        referenced_prefix = external_references[:start]
+        if any(referenced_prefix):
+            copied_prefix_start = referenced_prefix.index(True)
+            copied_prefix_nodes = [
+                BNode() for _ in range(start - copied_prefix_start)
+            ]
+
+    result_head = replacement_head if start == 0 else chain[0][0]
+    if start > 0 and copied_prefix_start is not None:
+        result_head = (
+            copied_prefix_nodes[0] if copied_prefix_start == 0 else chain[0][0]
+        )
+
+    for index, value in enumerate(values):
+        node = replacement_nodes[index]
+        next_node = (
+            replacement_nodes[index + 1]
+            if index + 1 < len(replacement_nodes)
+            else tail
+        )
+        graph.set((node, RDF.first, value))
+        graph.set((node, RDF.rest, next_node))
+
+    if start > 0:
+        if copied_prefix_start is not None:
+            for index in range(copied_prefix_start, start):
+                node = copied_prefix_nodes[index - copied_prefix_start]
+                _, value, _ = chain[index]
+                next_node = (
+                    copied_prefix_nodes[index - copied_prefix_start + 1]
+                    if index + 1 < start
+                    else replacement_head
+                )
+                graph.add((node, RDF.first, value))
+                graph.add((node, RDF.rest, next_node))
+                _copy_non_collection_properties(graph, chain[index][0], node)
+
+            if copied_prefix_start > 0:
+                predecessor = chain[copied_prefix_start - 1][0]
+                graph.remove((predecessor, RDF.rest, None))
+                graph.add((predecessor, RDF.rest, copied_prefix_nodes[0]))
+        else:
+            predecessor = chain[start - 1][0]
+            graph.remove((predecessor, RDF.rest, None))
+            graph.add((predecessor, RDF.rest, replacement_head))
+
+    if start == 0 or copied_prefix_start is None:
+        reused_nodes = set(replacement_nodes)
+        for index in range(start, stop):
+            if external_references[index]:
+                break
+            node = chain[index][0]
+            if node in reused_nodes:
+                continue
+            graph.remove((node, RDF.first, None))
+            graph.remove((node, RDF.rest, None))
+
+    return result_head
 
 
 class Collection:
@@ -215,6 +416,13 @@ class Collection:
     def __iter__(self) -> Iterator[Node]:
         """Iterator over items in Collections"""
         return self.graph.items(self.uri)
+
+    def replace_range(
+        self, start: int, stop: int, replacement: Iterable[Node]
+    ) -> Node:
+        """Replace a half-open range and update this collection's list head."""
+        self.uri = replace_range(self.graph, self.uri, start, stop, replacement)
+        return self.uri
 
     def _end(self) -> Node:
         # find end of list
