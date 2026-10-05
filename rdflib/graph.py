@@ -2896,6 +2896,39 @@ class Dataset(ConjunctiveGraph):
         """Iterates over all quads in the store"""
         return self.quads((None, None, None, None))
 
+    def extract(
+        self,
+        resources: Union[IdentifiedNode, Iterable[IdentifiedNode]],
+        named_graphs: Optional[
+            Union[
+                _ContextIdentifierType,
+                _ContextType,
+                str,
+                Iterable[IdentifiedNode],
+            ]
+        ] = None,
+        allowed_predicates: Optional[Union[URIRef, Iterable[URIRef]]] = None,
+        *,
+        default_graph_visible: bool = False,
+        target_dataset: Optional["Dataset"] = None,
+    ) -> "Dataset":
+        """Extract the authorized view of one or more resources.
+
+        See :func:`rdflib.extract_dataset` for the traversal and blank-node
+        remapping rules.
+        """
+
+        from rdflib.extract import extract_dataset
+
+        return extract_dataset(
+            self,
+            resources,
+            named_graphs,
+            allowed_predicates,
+            default_graph_visible=default_graph_visible,
+            target_dataset=target_dataset,
+        )
+
     @overload
     def serialize(
         self,
